@@ -11,9 +11,19 @@ upstream_repo="${2:-Mirantis/cri-dockerd}"
 
 get_tags() {
   local repo="$1"
-  # Fetch tags using gh api. --paginate to get all tags. -q '.[].name' for names.
-  # Sort the output for comm/diff
-  gh api "repos/$repo/tags" --paginate -q '.[].name' | sort
+  local limit="${2:-}"
+  
+  # Fetch tags using gh api. 
+  # -q '.[].name' returns names.
+  # The API returns tags in reverse chronological order (newest first).
+  if [ -n "$limit" ]; then
+    # For upstream, we only want the recent ones.
+    # We don't use --paginate here because we only want the first page/top N
+    gh api "repos/$repo/tags" --per-page "$limit" -q '.[].name'
+  else
+    # For downstream, we need all existing tags to check against
+    gh api "repos/$repo/tags" --paginate -q '.[].name'
+  fi
 }
 
 # Create temporary files for tag lists
@@ -23,11 +33,12 @@ downstream_tags_file=$(mktemp)
 # Cleanup on exit
 trap 'rm -f "$upstream_tags_file" "$downstream_tags_file"' EXIT
 
-echo "Fetching tags for upstream: $upstream_repo" >&2
-get_tags "$upstream_repo" > "$upstream_tags_file"
+echo "Fetching recent 5 tags for upstream: $upstream_repo" >&2
+# Get top 5 tags, then sort them for 'comm'
+get_tags "$upstream_repo" 5 | sort > "$upstream_tags_file"
 
-echo "Fetching tags for downstream: $downstream_repo" >&2
-get_tags "$downstream_repo" > "$downstream_tags_file"
+echo "Fetching all tags for downstream: $downstream_repo" >&2
+get_tags "$downstream_repo" | sort > "$downstream_tags_file"
 
 # Find lines in upstream that are NOT in downstream
 # comm -23 <(sort upstream) <(sort downstream)
