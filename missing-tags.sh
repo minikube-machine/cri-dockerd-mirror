@@ -1,76 +1,81 @@
-#!/bin/bash
-set -euo pipefail
-
-if [ "$#" -lt 1 ]; then
-  echo "Usage: missing-tags <downstream_repo> [upstream_repo]" >&2
-  exit 1
-fi
-
-downstream_repo="$1"
-upstream_repo="${2:-Mirantis/cri-dockerd}"
-
-get_tags() {
-  local repo="$1"
-  local limit="${2:-}"
-  
-  # Fetch tags using gh api. 
-  # -q '.[].name' returns names.
-  # The API returns tags in reverse chronological order (newest first).
-  if [ -n "$limit" ]; then
-    # For upstream, we only want the recent ones.
-    # We don't use --paginate here because we only want the first page/top N
-    gh api "repos/$repo/tags" --per-page "$limit" -q '.[].name'
-  else
-    # For downstream, we need all existing tags to check against
-    gh api "repos/$repo/tags" --paginate -q '.[].name'
-  fi
-}
-
-# Create temporary files for tag lists
-upstream_tags_file=$(mktemp)
-downstream_tags_file=$(mktemp)
-
-# Cleanup on exit
-trap 'rm -f "$upstream_tags_file" "$downstream_tags_file"' EXIT
-
-echo "Fetching recent 5 tags for upstream: $upstream_repo" >&2
-# Get top 5 tags, then sort them for 'comm'
-get_tags "$upstream_repo" 5 | sort > "$upstream_tags_file"
-
-echo "Fetching all tags for downstream: $downstream_repo" >&2
-get_tags "$downstream_repo" | sort > "$downstream_tags_file"
-
-# Find lines in upstream that are NOT in downstream
-# comm -23 <(sort upstream) <(sort downstream)
-# -2 suppresses lines only in file 2 (downstream)
-# -3 suppresses lines in both
-# So -23 gives lines unique to file 1 (upstream)
-missing_tags=$(comm -23 "$upstream_tags_file" "$downstream_tags_file")
-
-count=$(echo "$missing_tags" | grep -cve '^\s*$' || true)
-echo "Found $count missing tags." >&2
-
-# Convert newline-separated list to JSON array
-if [ -z "$missing_tags" ]; then
-  echo "[]"
-else
-  # Use jq if available, otherwise python/perl or manual construction
-  if command -v jq >/dev/null 2>&1; then
-    echo "$missing_tags" | jq -R . | jq -s -c .
-  else
-    # Fallback: manual JSON array construction
-    # escape quotes just in case, though tags usually don't have them
-    json="["
-    first=true
-    while IFS= read -r tag; do
-      if [ "$first" = true ]; then
-        first=false
-      else
-        json="$json,"
-      fi
-      json="$json\"$tag\""
-    done <<< "$missing_tags"
-    json="$json]"
-    echo "$json"
-  fi
-fi
+name: Mirror upstream releases
+on:
+  schedule:
+    - cron: '0 */8 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.tags.outputs.tags }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Find missing tags
+        id: tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tags=$(./missing-tags.sh ${{ github.repository }} Mirantis/cri-dockerd)
+          echo "tags=$tags" >> $GITHUB_OUTPUT
+  release:
+    needs: discover
+    if: needs.discover.outputs.tags != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 2 # Limit parallelism to avoid hitting API limits or overwhelming
+      matrix:
+        tag: ${{ fromJson(needs.discover.outputs.tags) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout self source
+        uses: actions/checkout@v4
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: Mirantis/cri-dockerd
+          ref: ${{ matrix.tag }}
+          path: upstream
+          fetch-depth: 1
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/go.mod
+      - name: Build
+        working-directory: upstream
+        run: |
+          version="${{ matrix.tag }}"
+          commit=$(git rev-parse HEAD)
+          short_commit=${commit:0:7}
+          
+          # Architectures to build
+          archs=("amd64" "arm64" "arm" "s390x" "ppc64le")
+          
+          mkdir -p build
+          
+          for arch in "${archs[@]}"; do
+            echo "Building for linux/$arch..."
+            env GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build \
+              -ldflags "-X github.com/Mirantis/cri-dockerd/version.Version=${version} -X github.com/Mirantis/cri-dockerd/version.GitCommit=${short_commit}" \
+              -o build/cri-dockerd-${version}.${arch}
+          done
+          
+          # Copy systemd files
+          cp packaging/systemd/cri-docker.service build/
+          cp packaging/systemd/cri-docker.socket build/
+          
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ matrix.tag }}"
+          # Create the release
+          gh release create "$tag" -t "$tag" -n "Mirror of upstream release $tag"
+          
+          # Upload assets
+          # The pattern matches all built binaries and systemd files
+          gh release upload "$tag" upstream/build/*
