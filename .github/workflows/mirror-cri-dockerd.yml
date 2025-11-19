@@ -32,6 +32,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout self source
+        uses: actions/checkout@v4
       - name: Checkout upstream source
         uses: actions/checkout@v4
         with:
