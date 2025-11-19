@@ -18,20 +18,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tags=$(./missing-tags ${{ github.repository }} Mirantis/cri-dockerd)
+          tags=$(./missing-tags.sh ${{ github.repository }} Mirantis/cri-dockerd)
           echo "tags=$tags" >> $GITHUB_OUTPUT
   release:
     needs: discover
     if: needs.discover.outputs.tags != '[]'
     strategy:
       fail-fast: false
-      max-parallel: 1 # Limit parallelism to avoid hitting API limits or overwhelming
+      max-parallel: 2 # Limit parallelism to avoid hitting API limits or overwhelming
       matrix:
         tag: ${{ fromJson(needs.discover.outputs.tags) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Checkout self source
+        uses: actions/checkout@v4
       - name: Checkout upstream source
         uses: actions/checkout@v4
         with:
