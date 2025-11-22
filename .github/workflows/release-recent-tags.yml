@@ -1,0 +1,95 @@
+name: Release recent upstream tags
+
+on:
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.collect.outputs.tags }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Collect latest upstream tags
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eo pipefail
+
+          tags=$(gh api repos/Mirantis/cri-dockerd/tags?per_page=10 -q '.[].name' | jq -R . | jq -s .)
+
+          if [ -z "$tags" ] || [ "$tags" = "[]" ]; then
+            echo "No tags found"
+            echo "tags=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: discover
+    if: needs.discover.outputs.tags != '[]' && needs.discover.outputs.tags != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJson(needs.discover.outputs.tags) }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: Mirantis/cri-dockerd
+          ref: ${{ matrix.tag }}
+          path: upstream
+          fetch-depth: 1
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/go.mod
+      - name: Build binaries
+        working-directory: upstream
+        run: |
+          set -eux -o pipefail
+
+          version="${{ matrix.tag }}"
+          commit=$(git rev-parse HEAD)
+          short_commit=${commit:0:7}
+          archs=("amd64" "arm64" "arm" "s390x" "ppc64le")
+
+          mkdir -p build
+
+          for arch in "${archs[@]}"; do
+            echo "Building linux/$arch"
+            env GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build \
+              -ldflags "-X github.com/Mirantis/cri-dockerd/version.Version=${version} -X github.com/Mirantis/cri-dockerd/version.GitCommit=${short_commit}" \
+              -o "build/cri-dockerd-${version}.${arch}"
+          done
+
+          cp packaging/systemd/cri-docker.service build/
+          cp packaging/systemd/cri-docker.socket build/
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux -o pipefail
+
+          tag="${{ matrix.tag }}"
+          notes="Mirror of upstream tag ${tag}"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists. Uploading assets."
+          else
+            gh release create "$tag" --title "$tag" --notes "$notes"
+          fi
+
+          gh release upload "$tag" upstream/build/* --clobber
